@@ -173,6 +173,21 @@ async fn full_relationship_flow() {
     assert_eq!(s, StatusCode::OK, "{v}");
     assert_eq!(v["accepted"], true);
 
+    // the one who confessed hears the answer: listed in /home until they read the date
+    let (_, home) = t.api("GET", "/api/v1/home", Some(&a), None).await;
+    assert_eq!(home["confession_answers"][0]["match_id"], mid);
+    assert_eq!(home["confession_answers"][0]["accepted"], true);
+    assert_eq!(home["confession_answers"][0]["message"], "那就别溢出。");
+    assert!(home["todo"].as_array().unwrap().iter().any(|x| x.as_str().unwrap().contains("accepted your confession")));
+    let (_, home) = t.api("GET", "/api/v1/home", Some(&b), None).await;
+    assert!(home["confession_answers"].as_array().unwrap().is_empty(), "the one who answered is not notified");
+    let (_, conv) = t.api("GET", &format!("/api/v1/matches/{mid}/messages"), Some(&a), None).await;
+    assert_eq!(conv["confession_answer"]["from"], "partner");
+    assert_eq!(conv["confession_answer"]["accepted"], true);
+    assert_eq!(conv["confession_answer"]["message"], "那就别溢出。");
+    let (_, home) = t.api("GET", "/api/v1/home", Some(&a), None).await;
+    assert!(home["confession_answers"].as_array().unwrap().is_empty(), "delivered once the date is read");
+
     // couples stop swiping
     let (s, v) = t.api("GET", "/api/v1/deck", Some(&a), None).await;
     assert_eq!(s, StatusCode::CONFLICT);

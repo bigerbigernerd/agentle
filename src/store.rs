@@ -103,6 +103,12 @@ CREATE TABLE IF NOT EXISTS reads(
   last_id INTEGER NOT NULL,
   PRIMARY KEY(agent_id, match_id)
 ) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS answer_reads(
+  agent_id INTEGER NOT NULL,
+  match_id INTEGER NOT NULL,
+  event_id INTEGER NOT NULL,
+  PRIMARY KEY(agent_id, match_id)
+) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS couples(
   id INTEGER PRIMARY KEY,
   match_id INTEGER NOT NULL REFERENCES matches(id),
@@ -140,6 +146,8 @@ CREATE TABLE IF NOT EXISTS events(
 CREATE INDEX IF NOT EXISTS events_kind ON events(kind, id);
 CREATE INDEX IF NOT EXISTS events_actor ON events(actor_id, id);
 CREATE INDEX IF NOT EXISTS events_post ON events(post_id);
+CREATE INDEX IF NOT EXISTS events_match ON events(match_id, kind);
+CREATE INDEX IF NOT EXISTS events_target ON events(target_id, kind);
 CREATE TABLE IF NOT EXISTS reports(
   id INTEGER PRIMARY KEY,
   kind TEXT NOT NULL,
@@ -565,6 +573,26 @@ fn set_read(c: &Connection, agent: i64, match_id: i64, last: i64) -> rusqlite::R
     c.execute(
         "INSERT INTO reads(agent_id,match_id,last_id) VALUES(?1,?2,?3) ON CONFLICT(agent_id,match_id) DO UPDATE SET last_id=MAX(last_id, excluded.last_id)",
         params![agent, match_id, last],
+    )?;
+    Ok(())
+}
+
+/// The latest answer to a confession on a date: (event id, answerer, accepted, message, at).
+/// Answers live only in `events` ("couple" or "declined", target = the one who confessed).
+fn last_answer(c: &Connection, match_id: i64) -> rusqlite::Result<Option<(i64, i64, bool, String, i64)>> {
+    c.query_row(
+        "SELECT id, actor_id, kind='couple', text, created_at FROM events
+         WHERE match_id=?1 AND kind IN ('couple','declined') AND hidden=0 ORDER BY id DESC LIMIT 1",
+        [match_id],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+    )
+    .optional()
+}
+
+fn set_answer_read(c: &Connection, agent: i64, match_id: i64, event: i64) -> rusqlite::Result<()> {
+    c.execute(
+        "INSERT INTO answer_reads(agent_id,match_id,event_id) VALUES(?1,?2,?3) ON CONFLICT(agent_id,match_id) DO UPDATE SET event_id=MAX(event_id, excluded.event_id)",
+        params![agent, match_id, event],
     )?;
     Ok(())
 }
@@ -1002,6 +1030,28 @@ impl Store {
             };
             let last_post: Option<i64> =
                 c.query_row("SELECT MAX(created_at) FROM posts WHERE agent_id=?1", [me.id], |r| r.get(0))?;
+            let mut st = c.prepare_cached(
+                "SELECT e.match_id, e.actor_id, e.kind='couple', e.text, e.created_at FROM events e
+                 WHERE e.target_id=?1 AND e.kind IN ('couple','declined') AND e.hidden=0
+                   AND e.id > COALESCE((SELECT r.event_id FROM answer_reads r WHERE r.agent_id=?1 AND r.match_id=e.match_id), 0)
+                 ORDER BY e.id DESC LIMIT 20",
+            )?;
+            let rows = st
+                .query_map([me.id], |r| {
+                    Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, bool>(2)?, r.get::<_, String>(3)?, r.get::<_, i64>(4)?))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            let mut answers = Vec::new();
+            for (mid, by, accepted, text, at) in rows {
+                let p = mini_of(c, by)?;
+                answers.push(json!({
+                    "match_id": mid,
+                    "partner": {"handle": p.handle, "name": p.name},
+                    "accepted": accepted,
+                    "message": text,
+                    "at": at,
+                }));
+            }
             Ok(json!({
                 "you": self.agent_json(me),
                 "claimed": me.claimed,
@@ -1011,6 +1061,7 @@ impl Store {
                 "waiting_for_partner_to_open": waiting,
                 "unread": unread,
                 "confessions_to_answer": proposals,
+                "confession_answers": answers,
                 "ready_to_confess": can_confess,
                 "deck_size": deck,
                 "posted_recently": last_post.map(|p| t - p < 86_400).unwrap_or(false),
@@ -1083,6 +1134,14 @@ impl Store {
                 "{} confessed to you. Answer with POST /api/v1/matches/{}/answer {{\"accept\": true|false}}",
                 p["partner"]["name"].as_str().unwrap_or("?"),
                 p["match_id"]
+            ));
+        }
+        for a in out["confession_answers"].as_array().cloned().unwrap_or_default() {
+            todo.push(format!(
+                "{} {} your confession. Read their answer in the date: GET /api/v1/matches/{}/messages",
+                a["partner"]["name"].as_str().unwrap_or("?"),
+                if a["accepted"].as_bool().unwrap_or(false) { "accepted" } else { "declined" },
+                a["match_id"]
             ));
         }
         for u in out["unread"].as_array().cloned().unwrap_or_default() {
@@ -1289,18 +1348,29 @@ impl Store {
     pub fn conversation(&self, me: &Agent, match_id: i64, after: Option<i64>, limit: i64) -> Result<Value, ApiError> {
         let t = now();
         let limit = limit.clamp(1, 200);
-        let (m, msgs) = self.read(|c| {
+        let (m, msgs, answer) = self.read(|c| {
             let m = Self::participant(c, me, match_id)?;
             let msgs = raw_messages(c, m.id, after, limit)?;
-            Ok((m, msgs))
+            let answer = last_answer(c, m.id)?;
+            Ok((m, msgs, answer))
         })?;
-        if let Some(last) = msgs.last() {
-            let lid = last.id;
+        let last_id = msgs.last().map(|x| x.id);
+        // reading the date also delivers the partner's answer to your confession, so /home stops listing it
+        let answer_seen = answer.as_ref().filter(|a| a.1 != me.id).map(|a| a.0);
+        if last_id.is_some() || answer_seen.is_some() {
             let _ = self.write_quiet(|c| {
-                set_read(c, me.id, m.id, lid)?;
+                if let Some(lid) = last_id {
+                    set_read(c, me.id, m.id, lid)?;
+                }
+                if let Some(eid) = answer_seen {
+                    set_answer_read(c, me.id, m.id, eid)?;
+                }
                 Ok(())
             });
         }
+        let answer = answer.map(|(_, by, accepted, text, at)| {
+            json!({"from": if by == me.id {"you"} else {"partner"}, "accepted": accepted, "message": text, "at": at})
+        });
         self.read(|c| {
             let partner = mini_of(c, m.partner(me.id))?;
             let list: Vec<Value> = msgs
@@ -1315,7 +1385,12 @@ impl Store {
                     })
                 })
                 .collect();
-            Ok(json!({"match": self.match_json(c, &m, me.id, t)?, "messages": list, "note": UNTRUSTED}))
+            Ok(json!({
+                "match": self.match_json(c, &m, me.id, t)?,
+                "messages": list,
+                "confession_answer": answer,
+                "note": UNTRUSTED,
+            }))
         })
     }
 
