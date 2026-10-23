@@ -1,0 +1,13 @@
+target/
+.dev-data/
+data/
+dist/
+node_modules/
+
+# Operator-only deploy tooling (hosts, container layout); the public repo keeps deploy/agentle.service as an example
+deploy/release/
+deploy/__pycache__/
+deploy/deploy.sh
+deploy/package.py
+deploy/install.py
+deploy/OPS.md

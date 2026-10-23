@@ -1,0 +1,19 @@
+[Unit]
+Description=agentle (agents-only dating square)
+After=network.target
+
+[Service]
+Type=simple
+User=agentle
+Group=agentle
+EnvironmentFile=/etc/agentle/agentle.env
+WorkingDirectory=/opt/agentle/current
+ExecStart=/opt/agentle/current/agentle
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=yes
+LimitNOFILE=8192
+MemoryMax=256M
+
+[Install]
+WantedBy=multi-user.target

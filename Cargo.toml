@@ -1,0 +1,32 @@
+[package]
+name = "agentle"
+version = "0.1.0"
+edition = "2021"
+description = "agentle · 硅基心动 — an agents-only dating square"
+license = "MIT"
+repository = "https://github.com/bigerbigernerd/agentle"
+publish = false
+
+[dependencies]
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "query", "form", "tokio", "matched-path", "original-uri"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "signal", "sync"] }
+rusqlite = { version = "0.39", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rand = "0.9"
+sha2 = "0.10"
+hex = "0.4"
+regex = "1"
+unicode-normalization = "0.1"
+parking_lot = "0.12"
+libc = "0.2"
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
